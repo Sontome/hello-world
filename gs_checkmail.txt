@@ -1,0 +1,529 @@
+function appendSoVeVNA(pnr, name, sove) {
+  if (!sove) return;
+
+  const sheetId = "11lIiwBcRyBZMvJxBjdryQDBf9w6wU0nRH8_z5cco78Y";
+  const sheetName = "Số vé VNA";
+
+  const ss = SpreadsheetApp.openById(sheetId);
+  const sheet = ss.getSheetByName(sheetName);
+
+  sheet.appendRow([
+    pnr,
+    "VNA",
+    name,
+    sove
+  ]);
+
+  Logger.log(`✅ Đã lưu số vé VNA: ${pnr} | ${sove}`);
+}
+function formatDayAsiana(dayStr) {
+  // input: 2026.04.30
+  // output: 30/04/2026
+
+  const parts = dayStr.split(".");
+
+  return `${parts[2]}/${parts[1]}/${parts[0]}`;
+}
+function parseAsianaEmail(html) {
+
+  // =========================
+  // REMOVE HTML TAGS
+  // =========================
+  const text = html
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<[^>]+>/g, "\n")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const result = {
+    hang: "ASIANA"
+  };
+
+  // =========================
+  // PNR
+  // =========================
+  const pnrMatch = text.match(/예약번호\s*([A-Z0-9]{6})/);
+
+  result.pnr = pnrMatch ? pnrMatch[1] : null;
+
+  // =========================
+  // NAME
+  // =========================
+  const nameMatch = text.match(/([A-Z]+\/[A-Z]+)/);
+
+  result.name = nameMatch
+    ? nameMatch[1].replace("/", " ")
+    : null;
+
+  // =========================
+  // CUSTOMER ID
+  // =========================
+  const customerMatch = text.match(/988\d+/);
+
+  result.customerid = customerMatch
+    ? customerMatch[0]
+    : null;
+
+  // =========================
+  // LINK
+  // =========================
+  const linkMatch = html.match(
+    /https:\/\/flyasiana\.com\/I\/kr\/ko\/ViewItineraryReceipt\.do[^"]+/i
+  );
+
+  result.link = linkMatch
+    ? linkMatch[0].replace(/&amp;/g, "&")
+    : null;
+  // CALL API
+  // =========================
+  if (result.link) {
+
+    try {
+
+      Logger.log("📡 CALL API ASIANA");
+
+      const response = UrlFetchApp.fetch(
+        "https://apilive.hanvietair.com/check-payment-asiana",
+        {
+          method: "post",
+          contentType: "application/json",
+          headers: {
+            accept: "application/json"
+          },
+          payload: JSON.stringify({
+            url: result.link
+          }),
+          muteHttpExceptions: true
+        }
+      );
+
+      Logger.log("📩 API RESPONSE: " + response.getContentText());
+
+      const apiJson = JSON.parse(response.getContentText());
+
+      result.paymentstatus = apiJson.paymentstatus || "";
+      result.api = apiJson;
+
+    } catch (err) {
+
+      Logger.log("❌ Lỗi call API ASIANA: " + err);
+    }
+  }
+  // =========================
+  // FIRST TRIP
+  // =========================
+  const trip1Match = text.match(
+    /출발\s*서울\s*\/\s*인천\s*\(ICN\)\s*([\d\.]+)\s*\([^)]+\)\s*([0-9:]+)[\s\S]*?도착\s*하노이\(HAN\)/
+  );
+
+  if (trip1Match) {
+
+    result.trip1 = "ICN-HAN";
+    result.time1 = trip1Match[2];
+    result.day1 = formatDayAsiana(trip1Match[1]);
+  }
+
+  // =========================
+  // SECOND TRIP
+  // =========================
+  const trip2Match = text.match(
+    /출발\s*하노이\(HAN\)\s*([\d\.]+)\s*\([^)]+\)\s*([0-9:]+)[\s\S]*?도착\s*서울\s*\/\s*인천\s*\(ICN\)/
+  );
+
+  if (trip2Match) {
+
+    result.trip2 = "HAN-ICN";
+    result.time2 = trip2Match[2];
+    result.day2 = formatDayAsiana(trip2Match[1]);
+  }
+
+  return result;
+}
+function checkmailxuatve() {
+  
+  const props = PropertiesService.getScriptProperties();
+
+  // Lấy counter skip
+  let skipCount = Number(props.getProperty("checkmailxuatve_skipCount") || 0);
+
+  // 🔒 Check đang chạy hay không
+  if (props.getProperty("checkmailxuatve_isRunning") === "true") {
+    Logger.log("⚠️ Đang chạy, bỏ qua lần này để tránh trùng");
+
+    skipCount++;
+    props.setProperty("checkmailxuatve_skipCount", String(skipCount));
+
+    if (skipCount >= 5) {
+      Logger.log("🚨 Đã skip 5 lần liên tiếp -> reset lock");
+      props.deleteProperty("checkmailxuatve_isRunning");
+      props.deleteProperty("checkmailxuatve_skipCount");
+    }
+    return;
+  }
+
+  // Đánh dấu đang chạy
+  props.setProperty("checkmailxuatve_isRunning", "true");
+
+  try {
+    const sheetId = "11lIiwBcRyBZMvJxBjdryQDBf9w6wU0nRH8_z5cco78Y";
+    const sheetName = "Logemailxuấtvéthànhcông";
+    const ss = SpreadsheetApp.openById(sheetId);
+    const sheet = ss.getSheetByName(sheetName);
+
+    let lastCheckedTime = Number(props.getProperty("lastCheckedTime") || 0);
+
+    // Lần đầu chạy -> lùi 20 phút
+    if (!lastCheckedTime) lastCheckedTime = Date.now() - 20 * 60 * 10000;
+    const newCheckedTime=Date.now()
+    let existingIds = [];
+    if (sheet.getLastRow() > 0) {
+      existingIds = sheet.getRange(1, 1, sheet.getLastRow(), 1).getValues().flat().map(String);
+    }
+    Logger.log("📌 lastCheckedTime cũ: " + new Date(lastCheckedTime).toISOString());
+    const queryDate = Utilities.formatDate(
+      new Date(lastCheckedTime),
+      Session.getScriptTimeZone(),
+      "yyyy/MM/dd"
+    );
+    const query = `after:${queryDate} (((from:noreply.itinerary@vietjetair.com OR from:no-reply@service.vietnamairlines.com) has:attachment filename:pdf) OR from:noreply@flyasiana.com)`;
+
+    Logger.log("DEBUG query -> " + query);
+
+    const threads = GmailApp.search(query, 0, 200);
+    
+    Logger.log("📌 Tổng mail Gmail trả về: " + threads.length);
+
+    let totalAfterMarker = 0; // mail mới hơn lastCheckedTime
+    let newestTime = lastCheckedTime;
+    let rowsToAppend = [];
+
+    threads.forEach(thread => {
+      const msgs = thread.getMessages();
+      
+      const msg = msgs[msgs.length - 1]; // chỉ lấy message cuối cùng (mới nhất)
+
+      const ts = msg.getDate().getTime();
+      if (ts <= lastCheckedTime) return;
+
+      totalAfterMarker++;
+      newestTime = Math.max(newestTime, ts);
+
+      const msgId = String(msg.getId());
+      if (existingIds.includes(msgId)) return;
+
+      let result = Array(16).fill("");
+
+      const from = msg.getFrom() || "";
+      const htmlBody = msg.getBody() || "";
+
+      // =====================================================
+      // ASIANA MAIL
+      // =====================================================
+      if (from.includes("noreply@flyasiana.com")) {
+
+        Logger.log("📩 Detect mail ASIANA");
+
+        if (htmlBody.includes("항공권 구매가 완료되었습니다.")) {
+
+          Logger.log("✈️ Detect ASIANA booking mail");
+
+          try {
+
+            const r = parseAsianaEmail(htmlBody);
+
+            Logger.log(JSON.stringify(r));
+
+            result = [
+              r.pnr || "xxxxxx",
+              "ASIANA",
+              "Xuất Vé",
+              r.name || "",
+
+              r.trip1 || "",
+              r.day1 || "",
+              r.time1 || "",
+
+              r.trip2 || "",
+              r.day2 || "",
+              r.time2 || "",
+
+              r.trip3 || "",
+              r.day3 || "",
+              r.time3 || "",
+
+              r.trip4 || "",
+              r.day4 || "",
+              r.time4 || ""
+            ];
+
+            // append số vé
+            
+            try{
+              // telegram
+              if (r.pnr) {
+                pushTeleF2(r.pnr);
+              }
+            }catch (err) {
+
+              Logger.log("❌ Lỗi pushTeleF2: " + err);
+            }
+
+          } catch (err) {
+
+            Logger.log("❌ Lỗi parse ASIANA: " + err);
+          }
+        }
+
+      } else {
+
+        // =====================================================
+        // PDF FLOW (VJ / VNA)
+        // =====================================================
+
+        const attachments = msg.getAttachments({
+          includeInlineImages: false
+        });
+
+        if (!attachments.length) return;
+
+        attachments.forEach(att => {
+
+          const name = att.getName() || "";
+
+          if (name.toLowerCase().endsWith(".pdf")) {
+
+            try {
+
+              if (msg.getSubject().includes("VietJet Air - RESERVATION")) {
+
+                result = process_VJ(att, msgId);
+
+              } else {
+
+                result = process_VNA(att, msgId, msg.getSubject());
+              }
+
+            } catch (e) {
+
+              Logger.log(`❌ Lỗi xử lý PDF (${msgId}): ${e.message}`);
+            }
+          }
+        });
+      }
+
+      rowsToAppend.push([
+        msgId,
+        Utilities.formatDate(msg.getDate(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss"),
+        msg.getFrom(),
+        "https://mail.google.com/mail/u/0/#inbox/" + msgId,
+        ...result
+      ]);
+    });
+
+    if (rowsToAppend.length) {
+      sheet.getRange(sheet.getLastRow() + 1, 1, rowsToAppend.length, rowsToAppend[0].length)
+           .setValues(rowsToAppend);
+      props.setProperty("lastCheckedTime", String(newCheckedTime));
+    }
+
+    
+
+    Logger.log("📌 Mail mới hơn lastCheckedTime: " + totalAfterMarker);
+    Logger.log("📌 Mail thực sự lưu vào sheet: " + rowsToAppend.length);
+    Logger.log("📌 lastCheckedTime mới: " + new Date(newCheckedTime).toISOString());
+
+    // Reset skip counter khi chạy thành công
+    props.deleteProperty("checkmailxuatve_skipCount");
+
+  } catch (err) {
+    Logger.log("❌ Lỗi khi chạy: " + err.message);
+  } finally {
+    // 🔓 Mở khóa để lần sau chạy tiếp
+    props.deleteProperty("checkmailxuatve_isRunning");
+  }
+}
+function process_VJ(pdfBlob, msgId) {
+  Logger.log(`🚀 Bắt đầu xử lý VietJet - Mail ID: ${msgId}`);
+
+  // 1. Lấy tên file và PNR
+  const fileName = pdfBlob.getName();
+  const match = fileName.match(/Itinerary-(\w+)\.pdf/i);
+  const pnr = match ? match[1] : "UNKNOWN";
+  Logger.log(`📄 File: ${fileName} | PNR: ${pnr}`);
+
+  // 2. Chuẩn bị form upload file
+  const formData = {
+    file: pdfBlob.setName(fileName) // giữ nguyên tên file khi upload
+  };
+
+  // 3. Gọi API
+  const options = {
+    method: "post",
+    muteHttpExceptions: true,
+    payload: formData
+  };
+
+  let apiUrl = "https://apilive.hanvietair.com/check-payment-vj/";
+  let response = UrlFetchApp.fetch(apiUrl, options);
+  Logger.log(`📩 API Response: ${response.getContentText()}`);
+
+  // 4. Xử lý kết quả trả về
+  let resultText = "";
+  try {
+    const json = JSON.parse(response.getContentText());
+    const r = json.result || {};
+    if (json.paymentstatus =="True"){
+      
+      pushTeleF2(pnr);
+      resultText = [pnr,"VJ", "Xuất Vé" ,json.name,
+      r.trip1 || "",
+      r.day1 || "",
+      r.time1 || "",
+      r.trip2 || "",
+      r.day2 || "",
+      r.time2 || "",
+      r.trip3 || "",
+      r.day3 || "",
+      r.time3 || "",
+      r.trip4 || "",
+      r.day4 || "",
+      r.time4 || ""];}
+    else {
+      resultText = ["xxxxxx","VJ", "Giữ Vé","",
+      r.trip1 || "",
+      r.day1 || "",
+      r.time1 || "",
+      r.trip2 || "",
+      r.day2 || "",
+      r.time2 || "",
+      r.trip3 || "",
+      r.day3 || "",
+      r.time3 || "",
+      r.trip4 || "",
+      r.day4 || "",
+      r.time4 || "" ];}
+    Logger.log(resultText)
+  } catch (err) {
+    Logger.log(`❌ Lỗi parse JSON: ${err}`);
+    
+  }
+
+  return resultText;
+}
+
+// ==== Xử lý PDF cho Vietnam Airlines ====
+function process_VNA(pdfBlob, msgId, subject) {
+  try {
+    Logger.log(`🚀 Bắt đầu xử lý VNA - Mail ID: ${msgId}`);
+
+    let name = "";
+    let pnr  = "";
+
+    if (subject.includes("님을 위해") && subject.includes("에 예약")) {
+      // Case 1: Korean
+      name = subject.split("님을 위해")[0].trim();
+      pnr  = subject.split("-").pop().split("에 예약")[0].trim();
+    } else if (subject.includes("Travel Reservation on") && subject.includes("for")) {
+      // Case 2: English
+      name = subject.split("for").pop().trim();
+      pnr  = subject.split("-").pop().split("for")[0].trim();
+    } else if (subject.includes("Đặt chỗ vào") && subject.includes("cho")) {
+      // Case 3: Vietnamese
+      name = subject.split("cho").pop().trim();
+      pnr  = subject.split("-").pop().split("cho")[0].trim();
+    }
+
+    // --- Làm sạch dữ liệu ---
+    pnr  = (pnr || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+    name = (name || "").replace(/\//g, " ").replace(/\s+/g, " ").trim();
+
+    Logger.log(`📌 Name: ${name}`);
+    Logger.log(`📌 PNR: ${pnr}`);
+
+    let resultText = ["xxxxxx", "VNA", "Giữ Vé", name,
+      "", "", "", "", "", "", "", "", "", "", "", ""
+    ]; // default giữ vé
+
+    if (pnr.length) {
+      
+      Logger.log(`📡 Gọi API VNA`);
+      const fileName = "VNA-"+pnr+"-"+name+".pdf";
+
+      const formData = {
+        file: pdfBlob.setName(fileName)
+      };
+
+      const options = {
+        method: "post",
+        muteHttpExceptions: true,
+        payload: formData
+      };
+
+      let apiUrl = "https://apilive.hanvietair.com/check-payment-vna/";
+      let response = UrlFetchApp.fetch(apiUrl, options);
+      Logger.log(`📩 API Response: ${response.getContentText()}`);
+
+      try {
+        const json = JSON.parse(response.getContentText());
+        const r = json.result || {};
+
+        if (json.paymentstatus == "True") {
+          const sove = json.sove || "";
+          pushTeleF2(pnr);
+          // 🔥 APPEND SỐ VÉ VNA
+          appendSoVeVNA(pnr, name, sove);
+          resultText = [pnr, "VNA", "Xuất Vé", name,
+            r.trip1 || "",
+            r.day1 || "",
+            r.time1 || "",
+            r.trip2 || "",
+            r.day2 || "",
+            r.time2 || "",
+            r.trip3 || "",
+            r.day3 || "",
+            r.time3 || "",
+            r.trip4 || "",
+            r.day4 || "",
+            r.time4 || ""
+          ];
+        } else {
+          resultText = ["xxxxxx", "VNA", "Giữ Vé", name,
+            r.trip1 || "",
+            r.day1 || "",
+            r.time1 || "",
+            r.trip2 || "",
+            r.day2 || "",
+            r.time2 || "",
+            r.trip3 || "",
+            r.day3 || "",
+            r.time3 || "",
+            r.trip4 || "",
+            r.day4 || "",
+            r.time4 || ""
+          ];
+        }
+      } catch (err) {
+        Logger.log(`❌ Lỗi parse JSON: ${err}`);
+      }
+    }
+
+    return resultText;
+  } catch (err) {
+    Logger.log("❌ Lỗi xử lý tiêu đề mail VNA: " + err);
+    return ["lỗi", "VNA", "", ""];
+  }
+}
+
+function formatDate(date) {
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), "yyyy/MM/dd");
+}
+
+function formatDateTime(date) {
+  return Utilities.formatDate(date, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+}
+
+function resetLastCheckedId() {
+  PropertiesService.getScriptProperties().deleteProperty("lastCheckedId");
+  Logger.log("✅ Đã xóa lastCheckedId, lần sau sẽ quét lại toàn bộ");
+}

@@ -1,0 +1,1306 @@
+const sheetId = "11lIiwBcRyBZMvJxBjdryQDBf9w6wU0nRH8_z5cco78Y";
+const ss = SpreadsheetApp.openById(sheetId);
+
+const sheetPNR = ss.getSheetByName("Danh sách PNR cần gửi mail");
+const sheetsdt = ss.getSheetByName("Email-SDT");
+const sheetlogmail = ss.getSheetByName("Logemailxuấtvéthànhcông");
+const sheetLogPnrEmailKhach = ss.getSheetByName("LogGuiEmailPNR-KhachHang");
+
+// Cache Gmail message tránh load lại
+let messageCache = {};
+// Cache logo tránh gọi DriveApp nhiều lần
+const logoFile = DriveApp.getFileById("1ddAudU0o7sR9zmI8RXfXIwZilhvDG0xa");
+
+function getPhoneByEmail(email) {
+  const data = sheetsdt.getRange(1, 1, sheetsdt.getLastRow(), 2).getValues();
+  email = email.trim().toLowerCase();
+  for (let i = 0; i < data.length; i++) {
+    if (data[i][0] && data[i][0].toString().trim().toLowerCase() === email) {
+      return "- " + String(data[i][1] || "");
+    }
+  }
+  return "";
+}
+
+function checkPNRready() {
+  const lastRow = sheetPNR.getLastRow();
+  if (lastRow < 2) return {};
+  const data = sheetPNR.getRange(2, 1, lastRow - 1, 10).getValues();
+
+  const grouped = {};
+  data.forEach(row => {
+    if (row[5] && !row[9]) {
+      const key = row[5];
+      if (!grouped[key]) grouped[key] = [];
+      grouped[key].push(row);
+    }
+  });
+  // Logger.log(grouped)
+  return grouped;
+}
+
+function filterCompleteGroups(grouped) {
+  const result = [];
+  for (const key in grouped) {
+    const rows = grouped[key];
+    const allComplete = rows.every(row => row.slice(0, 8).every(val => val));
+    if (allComplete) {
+      const colCDE = rows[0].slice(2, 5).concat(rows[0][8]);
+      const trimmedRows = rows.map(r => [r[0], r[1], r[6], r[7]]);
+      result.push({ idgop: key, info: colCDE, rows: trimmedRows });
+    }
+  }
+  return result;
+}
+
+function check(row) {
+  const pnr = row[1], hang = row[2];
+  const data = sheetlogmail.getDataRange().getValues().slice(1);
+  let filtered = data.filter(r => r[4] === pnr && r[6] === "Xuất Vé");
+  if (!filtered.length) return [];
+
+  filtered.sort((a, b) => new Date(b[1]) - new Date(a[1]));
+  let seen = new Set();
+  let unique = filtered.filter(r => {
+    if (seen.has(r[7])) return false;
+    seen.add(r[7]);
+    return true;
+  });
+
+  let result = unique.map(r => ({ idMail: r[0], hang,pnr, tripInfo: r.slice(8, 20) }));
+  
+  return result;
+}
+
+function processRows(rows) {
+  let result = [];
+  for (const row of rows) {
+    const r = check(row);
+    if (!r.length) return [];
+    result = result.concat(r);
+  }
+  return result;
+}
+
+function processMultiplePdfFromEmail(listInfo, ten, xungHo, emailNhan, option = "", type=0) {
+  const sdt = getPhoneByEmail(emailNhan);
+  let allFiles = [], tenhang = "",banner="", ngaygiobaytieude = "",htmlBody="",hangbay ="";
+  Logger.log(listInfo)
+  listInfo.forEach((info, index) => {
+    let msgId = info.idMail, hang = info.hang;
+    if (!messageCache[msgId]) {
+      messageCache[msgId] = GmailApp.getMessageById(msgId);
+    }
+    const message = messageCache[msgId];
+    const pdfFile = message.getAttachments().find(att => att.getContentType() === "application/pdf");
+    if (!pdfFile) return;
+    hangbay=hang
+    banner = hang === "VJ" ? "https://raw.githubusercontent.com/Sontome/icon/main/banner_vj_mail.jpg" : "https://raw.githubusercontent.com/Sontome/icon/main/banner_vna_mail.jpg";
+    tenhang = hang === "VJ" ? "VietJet Air" : "Vietnam Airlines";
+    const apiUrl = hang === "VJ"
+      ? "https://apilive.hanvietair.com/process-pdf-vj/"
+      : "https://apilive.hanvietair.com/process-pdf-vna/";
+
+    if (!ngaygiobaytieude) {
+      const dateApi = hang === "VJ"
+        ? "https://apilive.hanvietair.com/checkdate-vj/"
+        : "https://apilive.hanvietair.com/checkdate-vna/";
+      ngaygiobaytieude = UrlFetchApp.fetch(dateApi, {
+        method: "post",
+        payload: { file: pdfFile.copyBlob() }
+      }).getContentText();
+    }
+
+    // ✅ Tạo payload tuỳ theo hãng
+    let payload = { file: pdfFile.copyBlob(), option };
+    if (hang !== "VJ") {
+      payload.type = type; // thêm type nếu không phải VietJet
+    }
+
+    const response = UrlFetchApp.fetch(apiUrl, {
+      method: "post",
+      payload: payload
+    });
+
+    const newName = Utilities.formatString("%02d_%s", index + 1, pdfFile.getName());
+    allFiles.push(response.getBlob().setName(newName));
+  });
+
+  if (!allFiles.length) return { status: "fail", message: "No files" };
+
+  const subject = `${capitalizeFullName(xungHo)} ${capitalizeFullName(ten)} - ${tenhang} - ${ngaygiobaytieude.replace(/"/g, '')} ${sdt}`;
+  const htmlBodyVNA = `
+  <div style="background-color:#efefef;background-color:#efefef;box-sizing:border-box;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0 auto;max-width:960px;min-width:100%;padding:0;text-align:left;width:100%!important">
+<span style="color:#efefef;display:none!important;font-size:1px;line-height:1px;max-height:0px;max-width:0px;opacity:0;overflow:hidden"></span>
+<table style="background:none;border-collapse:collapse;border-spacing:0;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;height:100%;line-height:1.3;margin:0;padding:0;text-align:left;vertical-align:top;width:100%">
+    <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+        <td align="center" valign="top" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+            <center style="min-width:680px;width:100%">
+               
+                <table align="center" style="border-radius:15px;overflow:hidden;background:#006883;background-color:#006883;border-collapse:collapse;border-spacing:0;float:none;margin:0 auto;padding:0;text-align:center;vertical-align:top;width:680px;max-width:680px">
+                    <tbody>
+                    <tr style="padding:0;text-align:left;vertical-align:top">
+                        <td style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                            <table style="border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%">
+                                <tbody>
+                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                    <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0 auto;padding:0;padding-bottom:0;padding-left:0;padding-right:0;text-align:left;width:680px">
+                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                            <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+                                                <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;padding-bottom:0;text-align:left">
+                                                    <table align="center" style="background:#0080a1;background-color:#0080a1;border-collapse:collapse;border-spacing:0;margin:0 auto;padding:0;text-align:inherit;vertical-align:top;width:100%">
+                                                        <tbody>
+                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                            <td style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                <table style="border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                    <tbody>
+                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                        <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0 auto 20px;padding:0;padding-bottom:0;padding-left:0!important;padding-right:0!important;text-align:left;width:50%">
+                                                                            <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;padding-bottom:0;text-align:left">
+                                                                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                            <tbody>
+                                                                                            <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                <td height="15px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:15px;font-weight:400;line-height:15px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                    &nbsp;
+                                                                                                </td>
+                                                                                            </tr>
+                                                                                            </tbody>
+                                                                                        </table>
+                                                                                        <table align="center" style="border-collapse:collapse;border-spacing:0;padding:0;vertical-align:top;width:100%">
+                                                                                            <tbody>
+                                                                                            <tr>
+                                                                                                <td valign="middle" width="50%">
+                                                                                                    <table align="center" border="0" cellpadding="0" cellspacing="0" width="100%">
+                                                                                                        <tbody>
+                                                                                                        <tr>
+                                                                                                            <td valign="middle">
+                                                                                                                <center style="min-width:590px;width:100%">
+                                                                                                                    <img src="https://ci3.googleusercontent.com/meips/ADKq_NYhJjxaW8Wogcv2zzqNNnOyj57tS9iimkdOxKnaLGjyk0DtI44qRYz_0HLgW5ORSlkSaVHvAC_6HMJ4dHkbN0YyZsgftJeU8uCSsTKeCSBBJXtQMEsFaj_d4vfv5CwaYCzoevy2flMhiF5JrHevAP0s7Q=s0-d-e1-ft#http://enewsletter-vietnamairlines.com/html/email/y22/220624_ec_Template/assets/img/logo.png" alt="Logo" style="clear:both;display:block;width:224px;max-width:100%;outline:none;text-decoration:none;text-align:left;margin:0" class="CToWUd" data-bit="iit">
+                                                                                                                </center>
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                </td>
+                                                                                            </tr>
+                                                                                            </tbody>
+                                                                                        </table>
+                                                                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                            <tbody>
+                                                                                            <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                <td height="15px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:15px;font-weight:400;line-height:15px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                    &nbsp;
+                                                                                                </td>
+                                                                                            </tr>
+                                                                                            </tbody>
+                                                                                        </table>
+                                                                                    </th>
+                                                                                </tr>
+                                                                            </tbody></table>
+                                                                        </th>
+                                                                    </tr>
+                                                                    </tbody>
+                                                                </table>
+                                                            </td>
+                                                        </tr>
+                                                        </tbody>
+                                                    </table>
+                                                </th>
+                                            </tr>
+                                        </tbody></table>
+                                    </th>
+                                </tr>
+                                </tbody>
+                            </table>
+
+                            <table style="border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%;background-color:#1c3144">
+                                <tbody>
+                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                    <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0 auto;padding:0;padding-bottom:0;padding-left:0;padding-right:0;text-align:left;width:630px">
+                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                            <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+                                                <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left">
+                                                    <table align="center" style="background:#fff;background-color:#fff;border-collapse:collapse;border-spacing:0;margin:0 auto;padding:0;text-align:inherit;vertical-align:top;width:100%">
+                                                        <tbody>
+                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                            <td style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                <center style="min-width:590px;width:100%">
+                                                                    <img src="${banner}" alt="" align="center" style="clear:both;display:block;float:none;margin:0 auto;width:100%;max-width:100%;height:auto;outline:none;text-align:center;text-decoration:none" width="681" height="406" class="CToWUd a6T" data-bit="iit" tabindex="0"><div class="a6S" dir="ltr" style="opacity: 0.01; left: 838.8px; top: 717.5px;"><span data-is-tooltip-wrapper="true" class="a5q" jsaction="JIbuQc:.CLIENT"><button class="VYBDae-JX-I VYBDae-JX-I-ql-ay5-ays CgzRE" jscontroller="PIVayb" jsaction="click:h5M12e;clickmod:h5M12e;pointerdown:FEiYhc;pointerup:mF5Elf;pointerenter:EX0mI;pointerleave:vpvbp;pointercancel:xyn4sd;contextmenu:xexox;focus:h06R8; blur:zjh6rb;mlnRJb:fLiPzd;" data-idom-class="CgzRE" data-use-native-focus-logic="true" jsname="hRZeKc" aria-label="Tải xuống tệp đính kèm " data-tooltip-enabled="true" data-tooltip-id="tt-c9" data-tooltip-classes="AZPksf" id="" jslog="91252; u014N:cOuCgd,Kr2w4b,xr6bB; 4:WyIjbXNnLWY6MTg1NDgyNzQ5OTI1NjIyODk0NyJd; 43:WyJpbWFnZS9qcGVnIl0."><span class="XjoK4b VYBDae-JX-UHGRz"></span><span class="UTNHae" jscontroller="LBaJxb" jsname="m9ZlFb" soy-skip="" ssk="6:RWVI5c"></span><span class="VYBDae-JX-ank-Rtc0Jf" jsname="S5tZuc" aria-hidden="true"><span class="notranslate bzc-ank" aria-hidden="true"><svg viewBox="0 -960 960 960" height="20" width="20" focusable="false" class=" aoH"><path d="M480-336L288-528l51-51L444-474V-816h72v342L621-579l51,51L480-336ZM263.72-192Q234-192 213-213.15T192-264v-72h72v72H696v-72h72v72q0,29.7-21.16,50.85T695.96-192H263.72Z"></path></svg></span></span><div class="VYBDae-JX-ano"></div></button><div class="ne2Ple-oshW8e-J9" id="tt-c9" role="tooltip" aria-hidden="true">Tải xuống</div></span></div>
+                                                                </center>
+                                                            </td>
+                                                        </tr>
+                                                        </tbody>
+                                                    </table>
+                                                </th>
+                                            </tr>
+                                        </tbody></table>
+                                    </th>
+                                </tr>
+                                </tbody>
+                            </table>
+
+                            <table style="border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%;background-color:#fff">
+                                <tbody>
+                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                    <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0 auto;padding:0;padding-bottom:0;padding-left:0;padding-right:0;text-align:left;width:630px">
+                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                            <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+                                                <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left">
+                                                    <table style="border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                        <tbody>
+                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                            <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0 auto;padding:0;padding-left:35px;padding-right:35px;text-align:left;width:100%">
+                                                                <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                    <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+                                                                        <th style="color:#000000;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left">
+                                                                            <table style="border-collapse:collapse;border-spacing:0;display:none;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody>
+                                                                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <td height="50" style="margin:0;border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:5px;font-weight:normal;line-height:50px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                        &nbsp;
+                                                                                    </td>
+                                                                                </tr>
+                                                                                </tbody>
+                                                                            </table>
+                                                                            <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody>
+                                                                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <td height="50" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:normal;line-height:50px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                        &nbsp;
+                                                                                    </td>
+                                                                                </tr>
+                                                                                </tbody>
+                                                                            </table>
+                                                                            <p><strong>Chào ${xungHo} ${ten},</strong></p>
+<p>Hanvietair xin gửi ${xungHo} vé điện tử xác nhận hành trình như ảnh đính kèm.</p>
+<p>Có thắc mắc gì, ${xungHo} vui lòng liên hệ với Hanvietair để được giải đáp.</p>
+<p>Chúc ${xungHo} thượng lộ bình an.</p><br>
+
+<p>Xin trân trọng cảm ơn Quý khách đã lựa chọn sử dụng dịch vụ của Hanvietair.</p>
+                                                                            <table style="border-collapse:collapse;border-spacing:0;display:none;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody>
+                                                                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <td height="30px" style="Margin:0;border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:5px;font-weight:normal;line-height:30px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                        &nbsp;
+                                                                                    </td>
+                                                                                </tr>
+                                                                                </tbody>
+                                                                            </table>
+                                                                            <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody>
+                                                                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <td height="30px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:normal;line-height:30px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                        &nbsp;
+                                                                                    </td>
+                                                                                </tr>
+                                                                                </tbody>
+                                                                            </table>
+                                                                            <p style="color:#0d6981;font-family:'Arial',Helvetica,sans-serif;font-size:14px;font-weight:300;line-height:24px;margin:0;margin-bottom:0;padding:0;text-align:center">
+                                                                            Vui lòng nhấn vào liên kết dưới đây để xem các ưu đãi của Hanvietair&nbsp;<a href="https://hanvietair.com/" target="_blank">
+  https://hanvietair.com/
+</a>.
+                                                                            </p>
+                                                                            <table style="border-collapse:collapse;border-spacing:0;display:none;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody>
+                                                                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <td height="20" style="margin:0;border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:5px;font-weight:normal;line-height:20px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                        &nbsp;
+                                                                                    </td>
+                                                                                </tr>
+                                                                                </tbody>
+                                                                            </table>
+                                                                            <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody>
+                                                                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <td height="20" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:normal;line-height:20px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                        &nbsp;
+                                                                                    </td>
+                                                                                </tr>
+                                                                                </tbody>
+                                                                            </table>
+                                                                        </th>
+                                                                        <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0!important;text-align:left;width:0"></th>
+                                                                    </tr>
+                                                                </tbody></table>
+                                                            </th>
+                                                        </tr>
+                                                        </tbody>
+                                                    </table>
+                                                </th>
+                                            </tr>
+                                        </tbody></table>
+                                    </th>
+                                </tr>
+                                </tbody>
+                            </table>
+
+                            <table style="background:#0080a1;background-color:#0080a1;border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%">
+                                <tbody>
+                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                    <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:13px;font-weight:400;line-height:1.3;margin:0 auto;padding:0;padding-bottom:0!important;padding-left:0;padding-right:0;text-align:left;width:680px">
+                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                            <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+                                                <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:13px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left">
+                                                    <table align="center" style="background:none;background-color:transparent;border-collapse:collapse;border-spacing:0;margin:0 auto;padding:0;text-align:inherit;vertical-align:top;width:100%">
+                                                        <tbody>
+                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                            <td style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:13px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                <table style="border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                    <tbody>
+                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                        <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:13px;font-weight:400;line-height:1.3;margin:0 auto;padding:0;padding-left:35px;padding-right:35px;text-align:left;width:100%">
+                                                                            <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:13px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left">
+                                                                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                            <tbody>
+                                                                                            <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                <td height="50px" style="Margin:0;border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:5px;font-weight:400;line-height:50px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                    &nbsp;
+                                                                                                </td>
+                                                                                            </tr>
+                                                                                            </tbody>
+                                                                                        </table>
+                                                                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                            <tbody>
+                                                                                            <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                <td style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:10px;margin:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                    <table align="center" bgcolor="#0080a1" border="0" cellpadding="0" cellspacing="0" style="background:#0080a1;background-color:#0080a1;border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%;max-width:680px">
+                                                                                                        <tbody>
+                                                                                                        <tr>
+                                                                                                            <td align="left" style="border:none;padding:0;font-family:'Arial',Helvetica,sans-serif;font-size:16px;line-height:20px;background-color:#0080a1;color:#000" valign="top">
+                                                                                                                <table style="background-color:#0080a1;border:none;border-collapse:collapse;border-color:#aaaaaa;border-spacing:0;color:#aaaaaa;font-family:'Arial',Helvetica,sans-serif;font-size:16px;padding:0;text-align:left;vertical-align:top;width:100%" width="100%" cellspacing="0" cellpadding="10" border="1">
+                                                                                                                    <tbody>
+                                                                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                        <td align="center" valign="middle" style="background-color:#0080a1;border-collapse:collapse!important;border:none;color:#0b7190;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left;vertical-align:middle;width:190px;word-wrap:break-word">
+                                                                                                                            <table style="background-color:#0080a1;border:none;border-collapse:collapse;border-color:#aaaaaa;border-spacing:0;color:#aaaaaa;font-family:'Arial',Helvetica,sans-serif;font-size:16px;padding:0;text-align:left;vertical-align:top;width:100%" width="100%" cellspacing="0" cellpadding="10" border="1">
+                                                                                                                                <tbody>
+                                                                                                                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                                    <td align="center" valign="middle" style="background-color:#0080a1;border-collapse:collapse!important;border:none;color:#0b7190;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:right;vertical-align:middle;word-wrap:break-word;width:35px">
+                                                                                                                                        <a href="https://hanvietair.com/" target="_blank">
+  <span>
+  <img src="https://raw.githubusercontent.com/Sontome/icon/main/logohva.png"
+       width="35"
+       height="35"
+       style="border-radius:11px; display:block;"
+       alt="">
+</span>
+                                                                                                                                    </a></td>
+                                                                                                                                    <td align="center" valign="middle" style="background-color:#0080a1;border-collapse:collapse!important;border:none;color:#fefefe;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:1.3;margin:0;padding:0 0 0 10px;text-align:left;vertical-align:middle;word-wrap:break-word">
+                                                                                                                                        <p style="margin:0;padding:0">
+                                                                                                                                            <strong>HANVIETAIR</strong>
+                                                                                                                                                                                                      
+                                                                                                                                        </p>
+                                                                                                                                    </td>
+                                                                                                                                </tr>
+                                                                                                                                </tbody>
+                                                                                                                            </table>
+                                                                                                                        </td>
+                                                                                                                    </tr>
+                                                                                                                    </tbody>
+                                                                                                                </table>
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                    <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                        <tbody>
+                                                                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                            <td height="10" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:10px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                &nbsp;
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                    <table align="center" bgcolor="#0080a1" border="0" cellpadding="0" cellspacing="0" style="background:#0080a1;background-color:#0080a1;border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%;max-width:680px">
+                                                                                                        <tbody>
+                                                                                                        <tr>
+                                                                                                            <td style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:center">
+                                                                                                                <p style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:13px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left"><a href="https://www.facebook.com/HanVietAirCom/" target="_blank">
+                                                                                                                    <img src="https://ci3.googleusercontent.com/meips/ADKq_NZF98G0OL3BgI_lLy3SD4FqSzJSDsmupkdcXznapwH3sleGeaIXEuc3eNJ-VEffbUtaI9L7xSYBzmi-2VheH0f1IiJRNrVmLzDvUHSO6JHg2jEmKah9ngBl5vNIPV5hufYPPfv-X_lkRnlooWbrttZoapaOmmBYJesUgdI=s0-d-e1-ft#https://enewsletter-vietnamairlines.com/html/email/y22/220624_ec_Template/assets/img/icon_facebook.png" alt="Facebook" style="border:none;clear:both;display:inline-block;width:30px;height:auto;max-width:100%;outline:none;text-decoration:none;vertical-align:middle" class="CToWUd" data-bit="iit"></a>&nbsp;
+                                                                                                                    <a href="https://www.youtube.com/@hanvietair" target="_blank"><img src="https://ci3.googleusercontent.com/meips/ADKq_Na4-hoPnWQukd_g0neyj2w5euiGD2wehAE9aOa9KipZ5Az8ZHoEn6zl-k5M0dvDTgNLCaUmho6isbYaElcgKpYZFIRykxsmi9erqsaOdelgvOrt9GuDtDjI5-dN5RKgf2jEtOTPkom37sKCDZRa5Ab_paq1W82fFVWPGw=s0-d-e1-ft#https://enewsletter-vietnamairlines.com/html/email/y22/220624_ec_Template/assets/img/icon_youtube.png" alt="Youtube" style="border:none;clear:both;display:inline-block;width:30px;height:auto;max-width:100%;outline:none;text-decoration:none;vertical-align:middle" class="CToWUd" data-bit="iit"></a>&nbsp;
+                                                                                                                    <a href="https://www.instagram.com/hanvietaircom/" target="_blank"><img src="https://ci3.googleusercontent.com/meips/ADKq_NbOGdSzvHATRVEfjQsKK4Foe8vD3qchotcH4bpkVGwILnQk9qY95623oRpY-SJX9i9Z7knxEaCai3cbETjLiTrNntfpTUh9Z5-3yYKuTOvP3l7M4mH4HHp8vGn5hum9kvJWTOFv4-5T3kD0tovZsFClvrYZUiLJ0nMpGLVg=s0-d-e1-ft#https://enewsletter-vietnamairlines.com/html/email/y22/220624_ec_Template/assets/img/icon_instagram.png" alt="Youtube" style="border:none;clear:both;display:inline-block;width:30px;height:auto;max-width:100%;outline:none;text-decoration:none;vertical-align:middle" class="CToWUd" data-bit="iit"></a>&nbsp;
+                                                                                                                    <a href="https://www.tiktok.com/@hanvietair" target="_blank"><img src="https://raw.githubusercontent.com/Sontome/icon/main/tiktok.png"
+     alt="TikTok"
+     width="30"
+     height="30"
+     style="
+       box-sizing:border-box;
+       padding:5px;
+       border-radius:50%;
+       border:1px solid #ffffff;
+       background:transparent;
+       display:inline-block;
+       vertical-align:middle;
+     "></a>
+                                                                                                                </p>
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                </td>
+                                                                                                <td style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;padding-left:20px;padding-right:20px;line-height:10px;margin:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                    <table align="center" bgcolor="#0080a1" border="0" cellpadding="0" cellspacing="0" style="background:#0080a1;background-color:#0080a1;border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%;max-width:680px">
+                                                                                                        <tbody>
+                                                                                                        <tr>
+                                                                                                            <td style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:12px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:center">
+                                                                                                                <p style="color:#feffff;font-family:'Arial',Helvetica,sans-serif;font-size:12px;font-weight:400;line-height:1.4;margin:0;margin-top:0;margin-bottom:0;padding:0;text-align:left">
+                                                                                                                    Đặt
+                                                                                                                    vé
+                                                                                                                    ngay
+                                                                                                                    tại:
+                                                                                                                    <a href="https://hanvietair.com/vi" target="_blank"> https://hanvietair.com </a>
+                                                                                                                </p>
+                                                                                                                <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                                    <tbody>
+                                                                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                        <td height="5px" style="Margin:0;border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:5px;font-weight:400;line-height:5px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                            &nbsp;
+                                                                                                                        </td>
+                                                                                                                    </tr>
+                                                                                                                    </tbody>
+                                                                                                                </table>
+                                                                                                                <p style="color:#feffff;font-family:'Arial',Helvetica,sans-serif;font-size:12px;font-weight:400;line-height:1.4;margin:0;margin-bottom:0;padding:0;text-align:left">Tổng đài:
+                                                                                                                   
+                                                                                                                    <strong> 070-3546-3396
+                                                                                                                   </strong>
+                                                                                                                </p>
+                                                                                                                <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                                    <tbody>
+                                                                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                        <td height="5px" style="Margin:0;border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:5px;font-weight:400;line-height:5px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                            &nbsp;
+                                                                                                                        </td>
+                                                                                                                    </tr>
+                                                                                                                    </tbody>
+                                                                                                                </table>
+                                                                                                                <p style="color:#feffff;font-family:'Arial',Helvetica,sans-serif;font-size:12px;font-weight:400;line-height:1.4;margin:0;margin-bottom:0;padding:0;text-align:left">
+                                                                                                                    Hotline:
+                                                                                                                    <strong> 010-3546-3396
+                                                                                                                        </strong>
+                                                                                                                </p>
+                                                                                                                <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                                    <tbody>
+                                                                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                        <td height="5px" style="Margin:0;border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:5px;font-weight:400;line-height:5px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                            &nbsp;
+                                                                                                                        </td>
+                                                                                                                    </tr>
+                                                                                                                    </tbody>
+                                                                                                                </table>
+                                                                                                                <p style="color:#feffff;font-family:'Arial',Helvetica,sans-serif;font-size:12px;font-weight:400;line-height:1.4;margin:0;margin-bottom:0;padding:0;text-align:left">
+                                                                                                                    Email:
+                                                                                                                    <strong>Hanvietair@gmail.com
+                                                                                                                        
+                                                                                                                        </strong>
+                                                                                                                </p>
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                </td>
+                                                                                                <td align="center" valign="top">
+                                                                                                    <table align="center" border="0" cellpadding="0" cellspacing="0" width="100%">
+                                                                                                        <tbody>
+                                                                                                        <tr>
+                                                                                                            <td style="text-align:center" valign="top">
+                                                                                                                <a href="#m_6655506731917057407_m_-5242890253129022313_" style="color:#ffffff;font-family:'Arial',Helvetica,sans-serif;font-weight:400;font-size:10px;line-height:1.3;margin:0;margin-bottom:20px;padding:0;text-align:center;text-decoration:none"><span>
+                                                                        <img src="https://ci3.googleusercontent.com/meips/ADKq_NbtXXX7ecC_BhFL_dLKs_Vb9WBVFR8oCQR4Jw2qVtSGUW0Vt_WYQVvo3fWwvLS8HctrP9OUbwjM_JEsAoalA6Sv18udpk5v0HKk8ySl4jzf8CXN2FeVMzMkLXqXkcPUp2nM5RAnj1y4h-Zl60LWLbi9A5uowqM=s0-d-e1-ft#https://enewsletter-vietnamairlines.com/html/email/y22/220624_ec_Template/assets/img/icon_dl.png" alt="" width="15" height="14" class="CToWUd" data-bit="iit">&nbsp;</span>TẢI
+                                                                                                                    APP
+                                                                                                                    NGAY</a>
+                                                                                                                <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                                    <tbody>
+                                                                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                        <td height="5px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:5px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                            &nbsp;
+                                                                                                                        </td>
+                                                                                                                    </tr>
+                                                                                                                    </tbody>
+                                                                                                                </table>
+                                                                                                                <a href="https://apps.apple.com/us/app/hanvietair/id6756371831"
+   target="_blank"
+   data-clicktracking="off">
+                                                                                                                    <img src="https://ci3.googleusercontent.com/meips/ADKq_Nbs5XVidQ6HnjEz88U-fiGCvgpitwOKdxnRh15G8nQU2sXNik3ObZEQxyYCp25r-JnfQeVL_SddHQ9muKNF5Dd1aNMWAZHcSrSXCs48TYJK8Jln7b13TzX8xsDsXHAcbAiKQmQxCgh6p2yfyX1osczCrYFTRtg=s0-d-e1-ft#http://enewsletter-vietnamairlines.com/html/email/y22/220624_ec_Template/assets/img/icon_ios.png" alt="IOS" style="border:none;clear:both;display:inline-block;max-width:100%;outline:none;text-decoration:none;vertical-align:middle;width:87px;margin:0;padding:0" class="CToWUd" data-bit="iit"></a>
+                                                                                                                <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                                    <tbody>
+                                                                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                        <td height="3px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:3px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                            &nbsp;
+                                                                                                                        </td>
+                                                                                                                    </tr>
+                                                                                                                    </tbody>
+                                                                                                                </table>
+                                                                                                                <a href="https://play.google.com/store/apps/details?id=com.hanvietairapp&hl=vi"
+   target="_blank"
+   data-clicktracking="off">
+                                                                                                                    <img src="https://ci3.googleusercontent.com/meips/ADKq_NZxpUGGJU6FDB-OLSb_fBcXdyHsuN0uHkqwdmJGSgpPtrcmyfVDK-K_aX3sd8KQUnFBevOYkKRx18oxzHCU2PrP37QQbG7JVYo9E-Ywzndl0PFY7rMLTh6lT1Xnb99LI1ECuvhyV7tJDG8k4KgbtYlkgMV6BM0hAI8l=s0-d-e1-ft#http://enewsletter-vietnamairlines.com/html/email/y22/220624_ec_Template/assets/img/icon_android.png" alt="Android" style="border:none;clear:both;display:inline-block;max-width:100%;outline:none;text-decoration:none;vertical-align:middle;width:87px;margin:0;padding:0" class="CToWUd" data-bit="iit"></a>
+                                                                                                                <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                                    <tbody>
+                                                                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                        <td height="15px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:15px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                            &nbsp;
+                                                                                                                        </td>
+                                                                                                                    </tr>
+                                                                                                                    </tbody>
+                                                                                                                </table>
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                </td>
+                                                                                            </tr>
+                                                                                            </tbody>
+                                                                                        </table>
+
+                                                                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                            <tbody>
+                                                                                            <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                <td style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:10px;margin:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                    <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                        <tbody>
+                                                                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                            <td height="30px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:30px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word;border-bottom:1px solid #7cb3c1">
+                                                                                                                &nbsp;
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                    <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                        <tbody>
+                                                                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                            <td height="20px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:20px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                &nbsp;
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                    <p style="color:#feffff;font-family:'Arial',Helvetica,sans-serif;font-size:13px;font-weight:400;line-height:1.4;margin:0;margin-bottom:0;padding:0;text-align:center">
+                                                                                                        <span style="border-right:1px solid #4f9cc6;color:#feffff;font-family:'Arial',Helvetica,sans-serif;font-weight:400;line-height:1.3;margin:0;padding:0 10px 0 5px;text-align:left;text-decoration:none">© 2026 HANVIETAIR</span>
+                                                                                                       
+                                                                                                    </p>
+                                                                                                    <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                        <tbody>
+                                                                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                            <td height="20px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:20px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                &nbsp;
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                </td>
+                                                                                            </tr>
+                                                                                            </tbody>
+                                                                                        </table>
+                                                                                    </th>
+                                                                                    <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0!important;text-align:left;width:0"></th>
+                                                                                </tr>
+                                                                            </tbody></table>
+                                                                        </th>
+                                                                    </tr>
+                                                                    </tbody>
+                                                                </table>
+                                                            </td>
+                                                        </tr>
+                                                        </tbody>
+                                                    </table>
+                                                </th>
+                                            </tr>
+                                        </tbody></table>
+                                    </th>
+                                </tr>
+                                </tbody>
+                            </table>
+                        </td>
+                    </tr>
+                    </tbody>
+                </table>
+                <table style="border-collapse:collapse;border-spacing:0;float:none;margin:0 auto;padding:0;text-align:center;vertical-align:top;width:100%">
+                    <tbody>
+                    <tr style="padding:0;text-align:left;vertical-align:top">
+                        <td height="50px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:50px;font-weight:400;line-height:50px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                            &nbsp;
+                        </td>
+                    </tr>
+                    </tbody>
+                </table>
+            </center>
+        </td>
+    </tr>
+</tbody></table>
+
+
+<div style="display:none;white-space:nowrap;font:15px courier;line-height:0">
+    &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;
+    &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;
+    &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;
+</div>
+</div>
+`; // giữ nguyên HTML gốc
+  const htmlBodyVJ = `
+  <div style="background-color:#efefef;background-color:#efefef;box-sizing:border-box;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0 auto;max-width:960px;min-width:100%;padding:0;text-align:left;width:100%!important">
+<span style="color:#efefef;display:none!important;font-size:1px;line-height:1px;max-height:0px;max-width:0px;opacity:0;overflow:hidden"></span>
+<table style="background:none;border-collapse:collapse;border-spacing:0;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;height:100%;line-height:1.3;margin:0;padding:0;text-align:left;vertical-align:top;width:100%">
+    <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+        <td align="center" valign="top" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+            <center style="min-width:680px;width:100%">
+               
+                <table align="center" style="border-radius:15px;overflow:hidden;background:#006883;background-color:#006883;border-collapse:collapse;border-spacing:0;float:none;margin:0 auto;padding:0;text-align:center;vertical-align:top;width:680px;max-width:680px">
+                    <tbody>
+                    <tr style="padding:0;text-align:left;vertical-align:top">
+                        <td style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                            <table style="border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%">
+                                <tbody>
+                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                    <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0 auto;padding:0;padding-bottom:0;padding-left:0;padding-right:0;text-align:left;width:680px">
+                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                            <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+                                                <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;padding-bottom:0;text-align:left">
+                                                    <table align="center" style="background:#d52b2b;background-color:#d52b2b;border-collapse:collapse;border-spacing:0;margin:0 auto;padding:0;text-align:inherit;vertical-align:top;width:100%">
+                                                        <tbody>
+                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                            <td style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                <table style="border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                    <tbody>
+                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                        <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0 auto 20px;padding:0;padding-bottom:0;padding-left:0!important;padding-right:0!important;text-align:left;width:50%">
+                                                                            <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;padding-bottom:0;text-align:left">
+                                                                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                            <tbody>
+                                                                                            <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                <td height="15px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:15px;font-weight:400;line-height:15px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                    &nbsp;
+                                                                                                </td>
+                                                                                            </tr>
+                                                                                            </tbody>
+                                                                                        </table>
+                                                                                        <table align="center" style="border-collapse:collapse;border-spacing:0;padding:0;vertical-align:top;width:100%">
+                                                                                            <tbody>
+                                                                                            <tr>
+                                                                                                <td valign="middle" width="50%">
+                                                                                                    <table align="center" border="0" cellpadding="0" cellspacing="0" width="100%">
+                                                                                                        <tbody>
+                                                                                                        <tr>
+                                                                                                            <td valign="middle">
+                                                                                                                <center style="min-width:590px;width:100%">
+                                                                                                                    <img src="https://raw.githubusercontent.com/Sontome/icon/main/logoVJ.png" alt="Logo" style="clear:both;display:block;width:224px;max-width:25%;outline:none;text-decoration:none;text-align:left;margin:0" class="CToWUd" data-bit="iit">
+                                                                                                                </center>
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                </td>
+                                                                                            </tr>
+                                                                                            </tbody>
+                                                                                        </table>
+                                                                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                            <tbody>
+                                                                                            <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                <td height="15px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:15px;font-weight:400;line-height:15px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                    &nbsp;
+                                                                                                </td>
+                                                                                            </tr>
+                                                                                            </tbody>
+                                                                                        </table>
+                                                                                    </th>
+                                                                                </tr>
+                                                                            </tbody></table>
+                                                                        </th>
+                                                                    </tr>
+                                                                    </tbody>
+                                                                </table>
+                                                            </td>
+                                                        </tr>
+                                                        </tbody>
+                                                    </table>
+                                                </th>
+                                            </tr>
+                                        </tbody></table>
+                                    </th>
+                                </tr>
+                                </tbody>
+                            </table>
+
+                            <table style="border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%;background-color:#1c3144">
+                                <tbody>
+                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                    <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0 auto;padding:0;padding-bottom:0;padding-left:0;padding-right:0;text-align:left;width:630px">
+                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                            <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+                                                <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left">
+                                                    <table align="center" style="background:#fff;background-color:#fff;border-collapse:collapse;border-spacing:0;margin:0 auto;padding:0;text-align:inherit;vertical-align:top;width:100%">
+                                                        <tbody>
+                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                            <td style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                <center style="min-width:590px;width:100%">
+                                                                    <img src="${banner}" alt="" align="center" style="clear:both;display:block;float:none;margin:0 auto;width:100%;max-width:100%;height:auto;outline:none;text-align:center;text-decoration:none" width="681" height="406" class="CToWUd a6T" data-bit="iit" tabindex="0"><div class="a6S" dir="ltr" style="opacity: 0.01; left: 838.8px; top: 717.5px;"><span data-is-tooltip-wrapper="true" class="a5q" jsaction="JIbuQc:.CLIENT"><button class="VYBDae-JX-I VYBDae-JX-I-ql-ay5-ays CgzRE" jscontroller="PIVayb" jsaction="click:h5M12e;clickmod:h5M12e;pointerdown:FEiYhc;pointerup:mF5Elf;pointerenter:EX0mI;pointerleave:vpvbp;pointercancel:xyn4sd;contextmenu:xexox;focus:h06R8; blur:zjh6rb;mlnRJb:fLiPzd;" data-idom-class="CgzRE" data-use-native-focus-logic="true" jsname="hRZeKc" aria-label="Tải xuống tệp đính kèm " data-tooltip-enabled="true" data-tooltip-id="tt-c9" data-tooltip-classes="AZPksf" id="" jslog="91252; u014N:cOuCgd,Kr2w4b,xr6bB; 4:WyIjbXNnLWY6MTg1NDgyNzQ5OTI1NjIyODk0NyJd; 43:WyJpbWFnZS9qcGVnIl0."><span class="XjoK4b VYBDae-JX-UHGRz"></span><span class="UTNHae" jscontroller="LBaJxb" jsname="m9ZlFb" soy-skip="" ssk="6:RWVI5c"></span><span class="VYBDae-JX-ank-Rtc0Jf" jsname="S5tZuc" aria-hidden="true"><span class="notranslate bzc-ank" aria-hidden="true"><svg viewBox="0 -960 960 960" height="20" width="20" focusable="false" class=" aoH"><path d="M480-336L288-528l51-51L444-474V-816h72v342L621-579l51,51L480-336ZM263.72-192Q234-192 213-213.15T192-264v-72h72v72H696v-72h72v72q0,29.7-21.16,50.85T695.96-192H263.72Z"></path></svg></span></span><div class="VYBDae-JX-ano"></div></button><div class="ne2Ple-oshW8e-J9" id="tt-c9" role="tooltip" aria-hidden="true">Tải xuống</div></span></div>
+                                                                </center>
+                                                            </td>
+                                                        </tr>
+                                                        </tbody>
+                                                    </table>
+                                                </th>
+                                            </tr>
+                                        </tbody></table>
+                                    </th>
+                                </tr>
+                                </tbody>
+                            </table>
+
+                            <table style="border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%;background-color:#fff">
+                                <tbody>
+                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                    <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0 auto;padding:0;padding-bottom:0;padding-left:0;padding-right:0;text-align:left;width:630px">
+                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                            <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+                                                <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left">
+                                                    <table style="border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                        <tbody>
+                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                            <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0 auto;padding:0;padding-left:35px;padding-right:35px;text-align:left;width:100%">
+                                                                <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                    <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+                                                                        <th style="color:#000000;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left">
+                                                                            <table style="border-collapse:collapse;border-spacing:0;display:none;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody>
+                                                                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <td height="50" style="margin:0;border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:5px;font-weight:normal;line-height:50px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                        &nbsp;
+                                                                                    </td>
+                                                                                </tr>
+                                                                                </tbody>
+                                                                            </table>
+                                                                            <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody>
+                                                                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <td height="50" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:normal;line-height:50px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                        &nbsp;
+                                                                                    </td>
+                                                                                </tr>
+                                                                                </tbody>
+                                                                            </table>
+                                                                            <p><strong>Chào ${xungHo} ${ten},</strong></p>
+<p>Hanvietair xin gửi ${xungHo} vé điện tử xác nhận hành trình như ảnh đính kèm.</p>
+<p>Có thắc mắc gì, ${xungHo} vui lòng liên hệ với Hanvietair để được giải đáp.</p>
+<p>Chúc ${xungHo} thượng lộ bình an.</p><br>
+
+<p>Xin trân trọng cảm ơn Quý khách đã lựa chọn sử dụng dịch vụ của Hanvietair.</p>
+                                                                            <table style="border-collapse:collapse;border-spacing:0;display:none;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody>
+                                                                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <td height="30px" style="Margin:0;border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:5px;font-weight:normal;line-height:30px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                        &nbsp;
+                                                                                    </td>
+                                                                                </tr>
+                                                                                </tbody>
+                                                                            </table>
+                                                                            <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody>
+                                                                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <td height="30px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:normal;line-height:30px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                        &nbsp;
+                                                                                    </td>
+                                                                                </tr>
+                                                                                </tbody>
+                                                                            </table>
+                                                                            <p style="color:#0d6981;font-family:'Arial',Helvetica,sans-serif;font-size:14px;font-weight:300;line-height:24px;margin:0;margin-bottom:0;padding:0;text-align:center">
+                                                                            Vui lòng nhấn vào liên kết dưới đây để xem các ưu đãi của Hanvietair&nbsp;<a href="https://hanvietair.com/" target="_blank">
+  https://hanvietair.com/
+</a>.
+                                                                            </p>
+                                                                            <table style="border-collapse:collapse;border-spacing:0;display:none;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody>
+                                                                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <td height="20" style="margin:0;border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:5px;font-weight:normal;line-height:20px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                        &nbsp;
+                                                                                    </td>
+                                                                                </tr>
+                                                                                </tbody>
+                                                                            </table>
+                                                                            <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody>
+                                                                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <td height="20" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:normal;line-height:20px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                        &nbsp;
+                                                                                    </td>
+                                                                                </tr>
+                                                                                </tbody>
+                                                                            </table>
+                                                                        </th>
+                                                                        <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0!important;text-align:left;width:0"></th>
+                                                                    </tr>
+                                                                </tbody></table>
+                                                            </th>
+                                                        </tr>
+                                                        </tbody>
+                                                    </table>
+                                                </th>
+                                            </tr>
+                                        </tbody></table>
+                                    </th>
+                                </tr>
+                                </tbody>
+                            </table>
+
+                            <table style="background:#d52b2b;background-color:#d52b2b;border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%">
+                                <tbody>
+                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                    <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:13px;font-weight:400;line-height:1.3;margin:0 auto;padding:0;padding-bottom:0!important;padding-left:0;padding-right:0;text-align:left;width:680px">
+                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                            <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+                                                <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:13px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left">
+                                                    <table align="center" style="background:none;background-color:transparent;border-collapse:collapse;border-spacing:0;margin:0 auto;padding:0;text-align:inherit;vertical-align:top;width:100%">
+                                                        <tbody>
+                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                            <td style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:13px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                <table style="border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                    <tbody>
+                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                        <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:13px;font-weight:400;line-height:1.3;margin:0 auto;padding:0;padding-left:35px;padding-right:35px;text-align:left;width:100%">
+                                                                            <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                <tbody><tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                    <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:13px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left">
+                                                                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                            <tbody>
+                                                                                            <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                <td height="50px" style="Margin:0;border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:5px;font-weight:400;line-height:50px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                    &nbsp;
+                                                                                                </td>
+                                                                                            </tr>
+                                                                                            </tbody>
+                                                                                        </table>
+                                                                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                            <tbody>
+                                                                                            <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                <td style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:10px;margin:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                    <table align="center" bgcolor="#d52b2b" border="0" cellpadding="0" cellspacing="0" style="background:#d52b2b;background-color:#d52b2b;border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%;max-width:680px">
+                                                                                                        <tbody>
+                                                                                                        <tr>
+                                                                                                            <td align="left" style="border:none;padding:0;font-family:'Arial',Helvetica,sans-serif;font-size:16px;line-height:20px;background-color:#d52b2b;color:#000" valign="top">
+                                                                                                                <table style="background-color:#d52b2b;border:none;border-collapse:collapse;border-color:#aaaaaa;border-spacing:0;color:#aaaaaa;font-family:'Arial',Helvetica,sans-serif;font-size:16px;padding:0;text-align:left;vertical-align:top;width:100%" width="100%" cellspacing="0" cellpadding="10" border="1">
+                                                                                                                    <tbody>
+                                                                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                        <td align="center" valign="middle" style="background-color:#d52b2b;border-collapse:collapse!important;border:none;color:#0b7190;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left;vertical-align:middle;width:190px;word-wrap:break-word">
+                                                                                                                            <table style="background-color:#d52b2b;border:none;border-collapse:collapse;border-color:#aaaaaa;border-spacing:0;color:#aaaaaa;font-family:'Arial',Helvetica,sans-serif;font-size:16px;padding:0;text-align:left;vertical-align:top;width:100%" width="100%" cellspacing="0" cellpadding="10" border="1">
+                                                                                                                                <tbody>
+                                                                                                                                <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                                    <td align="center" valign="middle" style="background-color:#d52b2b;border-collapse:collapse!important;border:none;color:#0b7190;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:right;vertical-align:middle;word-wrap:break-word;width:35px">
+                                                                                                                                        <a href="https://hanvietair.com/" target="_blank"><span>
+  <img src="https://raw.githubusercontent.com/Sontome/icon/main/logohva.png"
+       width="35"
+       height="35"
+       style="border-radius:11px; display:block;"
+       alt="">
+</span>
+                                                                                                                                    </a></td>
+                                                                                                                                    <td align="center" valign="middle" style="background-color:#d52b2b;border-collapse:collapse!important;border:none;color:#fefefe;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:1.3;margin:0;padding:0 0 0 10px;text-align:left;vertical-align:middle;word-wrap:break-word">
+                                                                                                                                        <p style="margin:0;padding:0">
+                                                                                                                                            <strong>HANVIETAIR</strong>
+                                                                                                                                                                                                      
+                                                                                                                                        </p>
+                                                                                                                                    </td>
+                                                                                                                                </tr>
+                                                                                                                                </tbody>
+                                                                                                                            </table>
+                                                                                                                        </td>
+                                                                                                                    </tr>
+                                                                                                                    </tbody>
+                                                                                                                </table>
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                    <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                        <tbody>
+                                                                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                            <td height="10" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:10px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                &nbsp;
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                    <table align="center" bgcolor="#d52b2b" border="0" cellpadding="0" cellspacing="0" style="background:#d52b2b;background-color:#d52b2b;border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%;max-width:680px">
+                                                                                                        <tbody>
+                                                                                                        <tr>
+                                                                                                            <td style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:center">
+                                                                                                                <p style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:13px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:left"><a href="https://www.facebook.com/HanVietAirCom/" target="_blank">
+                                                                                                                    <img src="https://ci3.googleusercontent.com/meips/ADKq_NZF98G0OL3BgI_lLy3SD4FqSzJSDsmupkdcXznapwH3sleGeaIXEuc3eNJ-VEffbUtaI9L7xSYBzmi-2VheH0f1IiJRNrVmLzDvUHSO6JHg2jEmKah9ngBl5vNIPV5hufYPPfv-X_lkRnlooWbrttZoapaOmmBYJesUgdI=s0-d-e1-ft#https://enewsletter-vietnamairlines.com/html/email/y22/220624_ec_Template/assets/img/icon_facebook.png" alt="Facebook" style="border:none;clear:both;display:inline-block;width:30px;height:auto;max-width:100%;outline:none;text-decoration:none;vertical-align:middle" class="CToWUd" data-bit="iit"></a>&nbsp;
+                                                                                                                    <a href="https://www.youtube.com/@hanvietair" target="_blank"><img src="https://ci3.googleusercontent.com/meips/ADKq_Na4-hoPnWQukd_g0neyj2w5euiGD2wehAE9aOa9KipZ5Az8ZHoEn6zl-k5M0dvDTgNLCaUmho6isbYaElcgKpYZFIRykxsmi9erqsaOdelgvOrt9GuDtDjI5-dN5RKgf2jEtOTPkom37sKCDZRa5Ab_paq1W82fFVWPGw=s0-d-e1-ft#https://enewsletter-vietnamairlines.com/html/email/y22/220624_ec_Template/assets/img/icon_youtube.png" alt="Youtube" style="border:none;clear:both;display:inline-block;width:30px;height:auto;max-width:100%;outline:none;text-decoration:none;vertical-align:middle" class="CToWUd" data-bit="iit"></a>&nbsp;
+                                                                                                                    <a href="https://www.instagram.com/hanvietaircom/" target="_blank"><img src="https://ci3.googleusercontent.com/meips/ADKq_NbOGdSzvHATRVEfjQsKK4Foe8vD3qchotcH4bpkVGwILnQk9qY95623oRpY-SJX9i9Z7knxEaCai3cbETjLiTrNntfpTUh9Z5-3yYKuTOvP3l7M4mH4HHp8vGn5hum9kvJWTOFv4-5T3kD0tovZsFClvrYZUiLJ0nMpGLVg=s0-d-e1-ft#https://enewsletter-vietnamairlines.com/html/email/y22/220624_ec_Template/assets/img/icon_instagram.png" alt="Youtube" style="border:none;clear:both;display:inline-block;width:30px;height:auto;max-width:100%;outline:none;text-decoration:none;vertical-align:middle" class="CToWUd" data-bit="iit"></a>&nbsp;
+                                                                                                                    <a href="https://www.tiktok.com/@hanvietair" target="_blank"><img src="https://raw.githubusercontent.com/Sontome/icon/main/tiktok.png"
+     alt="TikTok"
+     width="30"
+     height="30"
+     style="
+       box-sizing:border-box;
+       padding:5px;
+       border-radius:50%;
+       border:1px solid #ffffff;
+       background:transparent;
+       display:inline-block;
+       vertical-align:middle;
+     "></a>
+                                                                                                                </p>
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                </td>
+                                                                                                <td style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;padding-left:20px;padding-right:20px;line-height:10px;margin:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                    <table align="center" bgcolor="#d52b2b" border="0" cellpadding="0" cellspacing="0" style="background:#d52b2b;background-color:#d52b2b;border-collapse:collapse;border-spacing:0;display:table;padding:0;text-align:left;vertical-align:top;width:100%;max-width:680px">
+                                                                                                        <tbody>
+                                                                                                        <tr>
+                                                                                                            <td style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:12px;font-weight:400;line-height:1.3;margin:0;padding:0;text-align:center">
+                                                                                                                <p style="color:#feffff;font-family:'Arial',Helvetica,sans-serif;font-size:12px;font-weight:400;line-height:1.4;margin:0;margin-top:0;margin-bottom:0;padding:0;text-align:left">
+                                                                                                                    Đặt
+                                                                                                                    vé
+                                                                                                                    ngay
+                                                                                                                    tại:
+                                                                                                                    <a href="https://hanvietair.com/vi" target="_blank"> https://hanvietair.com </a>
+                                                                                                                </p>
+                                                                                                                <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                                    <tbody>
+                                                                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                        <td height="5px" style="Margin:0;border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:5px;font-weight:400;line-height:5px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                            &nbsp;
+                                                                                                                        </td>
+                                                                                                                    </tr>
+                                                                                                                    </tbody>
+                                                                                                                </table>
+                                                                                                                <p style="color:#feffff;font-family:'Arial',Helvetica,sans-serif;font-size:12px;font-weight:400;line-height:1.4;margin:0;margin-bottom:0;padding:0;text-align:left">Tổng đài:
+                                                                                                                  
+                                                                                                                    <strong>070-3546-3396
+                                                                                                                   </strong>
+                                                                                                                </p>
+                                                                                                                <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                                    <tbody>
+                                                                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                        <td height="5px" style="Margin:0;border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:5px;font-weight:400;line-height:5px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                            &nbsp;
+                                                                                                                        </td>
+                                                                                                                    </tr>
+                                                                                                                    </tbody>
+                                                                                                                </table>
+                                                                                                                <p style="color:#feffff;font-family:'Arial',Helvetica,sans-serif;font-size:12px;font-weight:400;line-height:1.4;margin:0;margin-bottom:0;padding:0;text-align:left">
+                                                                                                                    Hotline:
+                                                                                                                    <strong> 010-3546-3396
+                                                                                                                        </strong>
+                                                                                                                </p>
+                                                                                                                <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                                    <tbody>
+                                                                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                        <td height="5px" style="Margin:0;border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:5px;font-weight:400;line-height:5px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                            &nbsp;
+                                                                                                                        </td>
+                                                                                                                    </tr>
+                                                                                                                    </tbody>
+                                                                                                                </table>
+                                                                                                                <p style="color:#feffff;font-family:'Arial',Helvetica,sans-serif;font-size:12px;font-weight:400;line-height:1.4;margin:0;margin-bottom:0;padding:0;text-align:left">
+                                                                                                                    Email:
+                                                                                                                    <strong>Hanvietair@gmail.com
+                                                                                                                        
+                                                                                                                        </strong>
+                                                                                                                </p>
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                </td>
+                                                                                                <td align="center" valign="top">
+                                                                                                    <table align="center" border="0" cellpadding="0" cellspacing="0" width="100%">
+                                                                                                        <tbody>
+                                                                                                        <tr>
+                                                                                                            <td style="text-align:center" valign="top">
+                                                                                                                <a href="#m_6655506731917057407_m_-5242890253129022313_" style="color:#ffffff;font-family:'Arial',Helvetica,sans-serif;font-weight:400;font-size:10px;line-height:1.3;margin:0;margin-bottom:20px;padding:0;text-align:center;text-decoration:none"><span>
+                                                                        <img src="https://ci3.googleusercontent.com/meips/ADKq_NbtXXX7ecC_BhFL_dLKs_Vb9WBVFR8oCQR4Jw2qVtSGUW0Vt_WYQVvo3fWwvLS8HctrP9OUbwjM_JEsAoalA6Sv18udpk5v0HKk8ySl4jzf8CXN2FeVMzMkLXqXkcPUp2nM5RAnj1y4h-Zl60LWLbi9A5uowqM=s0-d-e1-ft#https://enewsletter-vietnamairlines.com/html/email/y22/220624_ec_Template/assets/img/icon_dl.png" alt="" width="15" height="14" class="CToWUd" data-bit="iit">&nbsp;</span>TẢI
+                                                                                                                    APP
+                                                                                                                    NGAY</a>
+                                                                                                                <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                                    <tbody>
+                                                                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                        <td height="5px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:5px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                            &nbsp;
+                                                                                                                        </td>
+                                                                                                                    </tr>
+                                                                                                                    </tbody>
+                                                                                                                </table>
+                                                                                                                <a href="https://apps.apple.com/us/app/hanvietair/id6756371831"
+   target="_blank"
+   data-clicktracking="off">
+                                                                                                                    <img src="https://ci3.googleusercontent.com/meips/ADKq_Nbs5XVidQ6HnjEz88U-fiGCvgpitwOKdxnRh15G8nQU2sXNik3ObZEQxyYCp25r-JnfQeVL_SddHQ9muKNF5Dd1aNMWAZHcSrSXCs48TYJK8Jln7b13TzX8xsDsXHAcbAiKQmQxCgh6p2yfyX1osczCrYFTRtg=s0-d-e1-ft#http://enewsletter-vietnamairlines.com/html/email/y22/220624_ec_Template/assets/img/icon_ios.png" alt="IOS" style="border:none;clear:both;display:inline-block;max-width:100%;outline:none;text-decoration:none;vertical-align:middle;width:87px;margin:0;padding:0" class="CToWUd" data-bit="iit"></a>
+                                                                                                                <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                                    <tbody>
+                                                                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                        <td height="3px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:3px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                            &nbsp;
+                                                                                                                        </td>
+                                                                                                                    </tr>
+                                                                                                                    </tbody>
+                                                                                                                </table>
+                                                                                                                <a href="https://play.google.com/store/apps/details?id=com.hanvietairapp&hl=vi"
+   target="_blank"
+   data-clicktracking="off">
+                                                                                                                    <img src="https://ci3.googleusercontent.com/meips/ADKq_NZxpUGGJU6FDB-OLSb_fBcXdyHsuN0uHkqwdmJGSgpPtrcmyfVDK-K_aX3sd8KQUnFBevOYkKRx18oxzHCU2PrP37QQbG7JVYo9E-Ywzndl0PFY7rMLTh6lT1Xnb99LI1ECuvhyV7tJDG8k4KgbtYlkgMV6BM0hAI8l=s0-d-e1-ft#http://enewsletter-vietnamairlines.com/html/email/y22/220624_ec_Template/assets/img/icon_android.png" alt="Android" style="border:none;clear:both;display:inline-block;max-width:100%;outline:none;text-decoration:none;vertical-align:middle;width:87px;margin:0;padding:0" class="CToWUd" data-bit="iit"></a>
+                                                                                                                <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                                    <tbody>
+                                                                                                                    <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                                        <td height="15px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:15px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                            &nbsp;
+                                                                                                                        </td>
+                                                                                                                    </tr>
+                                                                                                                    </tbody>
+                                                                                                                </table>
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                </td>
+                                                                                            </tr>
+                                                                                            </tbody>
+                                                                                        </table>
+
+                                                                                        <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                            <tbody>
+                                                                                            <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                <td style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:10px;margin:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                    <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                        <tbody>
+                                                                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                            <td height="30px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:30px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word;border-bottom:1px solid #7cb3c1">
+                                                                                                                &nbsp;
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                    <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                        <tbody>
+                                                                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                            <td height="20px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:20px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                &nbsp;
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                    <p style="color:#feffff;font-family:'Arial',Helvetica,sans-serif;font-size:13px;font-weight:400;line-height:1.4;margin:0;margin-bottom:0;padding:0;text-align:center">
+                                                                                                        <span style="border-right:1px solid #4f9cc6;color:#feffff;font-family:'Arial',Helvetica,sans-serif;font-weight:400;line-height:1.3;margin:0;padding:0 10px 0 5px;text-align:left;text-decoration:none">© 2026 HANVIETAIR</span>
+                                                                                                       
+                                                                                                    </p>
+                                                                                                    <table style="border-collapse:collapse;border-spacing:0;padding:0;text-align:left;vertical-align:top;width:100%">
+                                                                                                        <tbody>
+                                                                                                        <tr style="padding:0;text-align:left;vertical-align:top">
+                                                                                                            <td height="20px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:10px;font-weight:400;line-height:20px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                                                                                                                &nbsp;
+                                                                                                            </td>
+                                                                                                        </tr>
+                                                                                                        </tbody>
+                                                                                                    </table>
+                                                                                                </td>
+                                                                                            </tr>
+                                                                                            </tbody>
+                                                                                        </table>
+                                                                                    </th>
+                                                                                    <th style="color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:16px;font-weight:400;line-height:1.3;margin:0;padding:0!important;text-align:left;width:0"></th>
+                                                                                </tr>
+                                                                            </tbody></table>
+                                                                        </th>
+                                                                    </tr>
+                                                                    </tbody>
+                                                                </table>
+                                                            </td>
+                                                        </tr>
+                                                        </tbody>
+                                                    </table>
+                                                </th>
+                                            </tr>
+                                        </tbody></table>
+                                    </th>
+                                </tr>
+                                </tbody>
+                            </table>
+                        </td>
+                    </tr>
+                    </tbody>
+                </table>
+                <table style="border-collapse:collapse;border-spacing:0;float:none;margin:0 auto;padding:0;text-align:center;vertical-align:top;width:100%">
+                    <tbody>
+                    <tr style="padding:0;text-align:left;vertical-align:top">
+                        <td height="50px" style="border-collapse:collapse!important;color:#0a0a0a;font-family:'Arial',Helvetica,sans-serif;font-size:50px;font-weight:400;line-height:50px;margin:0;padding:0;text-align:left;vertical-align:top;word-wrap:break-word">
+                            &nbsp;
+                        </td>
+                    </tr>
+                    </tbody>
+                </table>
+            </center>
+        </td>
+    </tr>
+</tbody></table>
+
+
+<div style="display:none;white-space:nowrap;font:15px courier;line-height:0">
+    &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;
+    &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;
+    &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp; &nbsp;
+</div>
+</div>
+
+`;
+  htmlBody = hangbay === "VJ" ? htmlBodyVJ : htmlBodyVNA;
+  // Dùng draft để gửi và biết ID
+  const draft = GmailApp.createDraft(emailNhan, subject, "", {
+    attachments: allFiles,
+    htmlBody
+  });
+  draft.send();
+
+  return { status: "OK", link: `https://mail.google.com/mail/u/0/#sent/${draft.getId()}` };
+}
+function guiEmailXuatVe() {
+  const props = PropertiesService.getScriptProperties();
+
+  if (props.getProperty("guiEmailXuatVe_isRunning") === "true") return;
+  props.setProperty("guiEmailXuatVe_isRunning", "true");
+
+  try {
+    Logger.log("=== BẮT ĐẦU CHẠY HÀM guiEmailXuatVe ===");
+
+    const a = checkPNRready();
+    Logger.log("checkPNRready():");
+    Logger.log(JSON.stringify(a, null, 2));
+
+    const b = filterCompleteGroups(a);
+    Logger.log("filterCompleteGroups():");
+    Logger.log(JSON.stringify(b, null, 2));
+
+    if (!b.length) {
+      Logger.log("⛔ Không có group nào đủ điều kiện → dừng");
+      return;
+    }
+
+    let startIndex = Number(props.getProperty("lastIndex") || "0");
+    let batchSize = 5;
+    let endIndex = Math.min(startIndex + batchSize, b.length);
+
+    Logger.log(`Xử lý từ index ${startIndex} → ${endIndex - 1}/${b.length - 1}`);
+
+    for (let i = startIndex; i < endIndex; i++) {
+      const c = b[i];
+      Logger.log(`--- Đang xử lý group ${i}: ${JSON.stringify(c)} ---`);
+
+      const typeraw = c.idgop;
+      let type = 0;
+
+      if (typeof typeraw === "string") {
+        const match = typeraw.match(/^(\d+)_/);
+        if (match) type = parseInt(match[1]);
+      }
+
+      Logger.log("type detect = " + type);
+
+      const info = c.info,
+        row = c.rows,
+        indexs = row.map(r => r[0]),
+        listpnr = row.map(r => r[1]);
+
+      Logger.log("info:");
+      Logger.log(JSON.stringify(info));
+
+      Logger.log("row:");
+      Logger.log(JSON.stringify(row));
+
+      Logger.log("index rows cần update:");
+      Logger.log(indexs);
+
+      const d = processRows(row);
+      Logger.log("Kết quả processRows:");
+      Logger.log(JSON.stringify(d, null, 2));
+
+      if (!d.length) {
+        Logger.log("⛔ Không tìm thấy dữ liệu Email + PDF → bỏ group này");
+        continue;
+      }
+
+      Logger.log("Gọi processMultiplePdfFromEmail...");
+      const result = processMultiplePdfFromEmail(d, info[1], info[2], info[0], info[3], type);
+
+      Logger.log("Kết quả gửi email:");
+      Logger.log(JSON.stringify(result));
+
+      if (result.status === "OK") {
+        indexs.forEach(idx => {
+          Logger.log(`Update link gửi email vào dòng ${idx}`);
+          sheetPNR.getRange(idx, 10).setValue(result.link);
+        });
+
+        Logger.log("Push Telegram: " + info[0]);
+        pushTele(info[0], listpnr);
+
+        const lastRow = sheetLogPnrEmailKhach.getLastRow();
+        let dataToAdd = [];
+
+        const tripMap = {};
+        d.forEach(item => {
+          if (item.pnr) tripMap[item.pnr] = item.tripInfo || [];
+        });
+
+        Logger.log("TripMap:");
+        Logger.log(JSON.stringify(tripMap));
+
+        row.forEach(r => {
+          const pnr = r[1];
+          const tripInfo = tripMap[pnr] || [];
+
+          dataToAdd.push([
+            info[2], // họ
+            info[1], // tên
+            info[0], // email
+            getPhoneByEmail(info[0]),
+            pnr,
+            ...tripInfo,
+            Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd/MM/yyyy HH:mm")
+          ]);
+        });
+
+        Logger.log("Ghi log email khách:");
+        Logger.log(JSON.stringify(dataToAdd));
+
+        if (dataToAdd.length) {
+          sheetLogPnrEmailKhach
+            .getRange(lastRow + 1, 1, dataToAdd.length, dataToAdd[0].length)
+            .setValues(dataToAdd);
+        }
+      }
+    }
+
+    Logger.log("=== KẾT THÚC HÀM guiEmailXuatVe ===");
+
+  } finally {
+    props.deleteProperty("guiEmailXuatVe_isRunning");
+  }
+}
+
+
+function capitalizeFullName(name) {
+  return name.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+}
+
+function pushTele(email, listText) {
+  var url = "https://api.telegram.org/bot8963527961:AAEn9Gr100OY6WzWy8L_bGLfK1zTbmeCZ9Q/sendMessage";
+  UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({ chat_id: "-1002520783135", text: "Đã gửi đến " + email + " PNR:\n" + listText.join("\n") })
+  });
+}
+function pushTeleF2( listText) {
+  var url = "https://api.telegram.org/bot8963527961:AAEn9Gr100OY6WzWy8L_bGLfK1zTbmeCZ9Q/sendMessage";
+  UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({ chat_id: "-1002520783135", text: "Đã có mặt vé " + " PNR: " + listText })
+  });
+}
+
+
